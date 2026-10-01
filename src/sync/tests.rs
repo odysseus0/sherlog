@@ -1890,3 +1890,56 @@ fn archived_copy_is_a_per_file_duplicate_error() {
         "the original binding is kept"
     );
 }
+
+/// Claude Code shares the write path: a transcript moved to another root is
+/// rebound to its new path as the same session.
+#[test]
+fn claude_code_moved_transcript_rebinds_the_session() {
+    let temp = tempdir().unwrap();
+    let hot = temp.path().join("projects");
+    let cold = temp.path().join("claude-archive");
+    let id = "33333333-3333-4333-8333-333333333333";
+    let line = |kind: &str, text: &str, second: u64| {
+        serde_json::json!({
+            "type": kind,
+            "sessionId": id,
+            "cwd": "/work/move",
+            "timestamp": format!("2026-09-26T00:00:{second:02}Z"),
+            "message": {"content": text},
+        })
+        .to_string()
+    };
+    let hot_path = hot.join("-work-move").join(format!("{id}.jsonl"));
+    let cold_path = cold.join("-work-move").join(format!("{id}.jsonl"));
+    fs::create_dir_all(hot_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(cold_path.parent().unwrap()).unwrap();
+    fs::write(&hot_path, format!("{}\n", line("user", "question", 1))).unwrap();
+    let claude = |root: &Path| Selector::All {
+        source: SourceId::ClaudeCode,
+        root: root.to_string_lossy().into_owned(),
+    };
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, claude(&hot))).unwrap();
+
+    let mut file = OpenOptions::new().append(true).open(&hot_path).unwrap();
+    writeln!(file, "{}", line("assistant", "answer", 2)).unwrap();
+    drop(file);
+    fs::rename(&hot_path, &cold_path).unwrap();
+
+    let report = run(SyncRequest::new(&db, claude(&cold))).unwrap();
+    assert_eq!(report.errors, 0, "{:?}", report.error_details);
+    let reader = IndexReader::open(&db).unwrap();
+    assert!(reader.check_invariants().unwrap().is_valid());
+    assert_eq!(reader.stats(SourceId::ClaudeCode).unwrap().session_count, 1);
+    assert_eq!(
+        source_file_paths(&db),
+        vec![cold_path.to_string_lossy().into_owned()]
+    );
+    assert_eq!(
+        session_file_path(&db),
+        vec![(
+            cold_path.to_string_lossy().into_owned(),
+            cold.to_string_lossy().into_owned()
+        )]
+    );
+}
