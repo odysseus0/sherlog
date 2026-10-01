@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::INDEX_VERSION;
-use crate::identity::SessionIdentity;
+use crate::identity::{SessionIdentity, SourceId};
 use crate::index::{
     ANALYZER_EPOCH, COVERAGE_EPOCH, CoverageWrite, IndexLayout, IndexReader, IndexTransaction,
     IndexWriter, MessageWrite, PROJECTION_EPOCH, SessionWrite, SourceFileState,
@@ -339,6 +339,23 @@ fn run_with_snapshot_hook_and_cutover(
     if !validation.errors.is_empty() && !request.best_effort {
         return Err(sync_failure_after_invalidation(&request, report));
     }
+    let moves = match resolve_session_moves(
+        &request.db_path,
+        &validation.identities,
+        &validation.invalid_paths,
+    ) {
+        Ok(moves) => moves,
+        Err(error) => {
+            report.record_error(request.db_path.to_string_lossy(), error);
+            return Err(sync_failure_after_invalidation(&request, report));
+        }
+    };
+    for detail in &moves.errors {
+        report.record_error(detail.file_path.clone(), detail.message.clone());
+    }
+    if !moves.errors.is_empty() && !request.best_effort {
+        return Err(sync_failure_after_invalidation(&request, report));
+    }
 
     let persisted_proofs = persisted_append_proofs(
         &before_files,
@@ -368,6 +385,7 @@ fn run_with_snapshot_hook_and_cutover(
 
     let mut omitted_paths = validation.invalid_paths;
     omitted_paths.extend(assessment.deferred_paths.iter().cloned());
+    omitted_paths.extend(moves.duplicate_paths.iter().cloned());
     let existing_cold_roots = existing
         .cold_roots
         .into_iter()
@@ -409,6 +427,7 @@ fn run_with_snapshot_hook_and_cutover(
         &stage,
         &state_by_path,
         &state_refreshes,
+        &moves.stale,
         &omitted_paths,
         &retained_hot_paths,
         &cold_ids,
@@ -653,6 +672,8 @@ struct StageValidation {
     staged_paths: BTreeSet<PathBuf>,
     invalid_paths: BTreeSet<PathBuf>,
     errors: Vec<SyncErrorDetail>,
+    /// Session identity of every projected (non-empty) staged file.
+    identities: Vec<(PathBuf, SessionIdentity)>,
 }
 
 fn validate_projection_stage(
@@ -673,10 +694,16 @@ fn validate_projection_stage(
     let mut staged_paths = BTreeSet::new();
     let mut invalid_paths = BTreeSet::new();
     let mut errors = Vec::new();
+    let mut identities = Vec::new();
 
     stage.read_all(|record| {
         let path = record.file.file_path.clone();
         staged_paths.insert(path.clone());
+        if let ProjectionOutcome::Projected(projected) = &record.outcome
+            && let Ok(identity) = projection_identity(projected)
+        {
+            identities.push((path.clone(), identity));
+        }
         let Some(before_file) = before.get(&path).copied() else {
             invalid_paths.insert(path.clone());
             errors.push(detail(&path, "staged file was not present in snapshot A"));
@@ -726,7 +753,116 @@ fn validate_projection_stage(
         staged_paths,
         invalid_paths,
         errors,
+        identities,
     })
+}
+
+/// An index binding left at a path that no longer exists, superseded by the
+/// staged file at `new_path` carrying the same session identity.
+struct StaleBinding {
+    new_path: PathBuf,
+    source_id: SourceId,
+    old_path: String,
+}
+
+struct SessionMoves {
+    stale: Vec<StaleBinding>,
+    duplicate_paths: BTreeSet<PathBuf>,
+    errors: Vec<SyncErrorDetail>,
+}
+
+/// Classify staged files whose exact session identity is already bound to a
+/// different raw path. If every other bound path is gone from disk the file
+/// was moved (Codex archiving, a renamed transcript): the session is rebound
+/// to the new path. If another bound path still exists, or two staged files
+/// share an identity, the file is a true duplicate and is refused on its own,
+/// so `--best-effort` skips only that file instead of failing the commit.
+/// Matching is by session identity only, never by content similarity.
+fn resolve_session_moves(
+    db_path: &Path,
+    identities: &[(PathBuf, SessionIdentity)],
+    skip: &BTreeSet<PathBuf>,
+) -> Result<SessionMoves, String> {
+    let mut moves = SessionMoves {
+        stale: Vec::new(),
+        duplicate_paths: BTreeSet::new(),
+        errors: Vec::new(),
+    };
+    let candidates = identities
+        .iter()
+        .filter(|(path, _)| !skip.contains(path))
+        .collect::<Vec<_>>();
+    let mut by_key = BTreeMap::<&str, Vec<&PathBuf>>::new();
+    for (path, identity) in &candidates {
+        by_key
+            .entry(identity.session_key.as_str())
+            .or_default()
+            .push(path);
+    }
+    for (key, paths) in &by_key {
+        if paths.len() < 2 {
+            continue;
+        }
+        for path in paths {
+            let others = paths
+                .iter()
+                .filter(|other| *other != path)
+                .map(|other| other.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            moves.duplicate_paths.insert((*path).clone());
+            moves.errors.push(detail(
+                path,
+                &format!(
+                    "session {key} is also present at {others:?}; refusing duplicate source file"
+                ),
+            ));
+        }
+    }
+    if !db_path.exists() {
+        return Ok(moves);
+    }
+    let reader = IndexReader::open(db_path).map_err(|error| error.to_string())?;
+    for (path, identity) in candidates {
+        if moves.duplicate_paths.contains(path) {
+            continue;
+        }
+        let current = path.to_string_lossy();
+        let mut live = Vec::new();
+        let mut gone = Vec::new();
+        for other in reader
+            .session_file_bindings(identity)
+            .map_err(|error| error.to_string())?
+        {
+            if other == current {
+                continue;
+            }
+            // Only a proven absence counts as a move; an unreadable path
+            // fails closed as a possible duplicate.
+            match Path::new(&other).try_exists() {
+                Ok(false) => gone.push(other),
+                Ok(true) | Err(_) => live.push(other),
+            }
+        }
+        if !live.is_empty() {
+            moves.duplicate_paths.insert(path.clone());
+            moves.errors.push(detail(
+                path,
+                &format!(
+                    "session {} is already indexed from {live:?}; refusing duplicate source file",
+                    identity.session_key
+                ),
+            ));
+            continue;
+        }
+        moves
+            .stale
+            .extend(gone.into_iter().map(|old_path| StaleBinding {
+                new_path: path.clone(),
+                source_id: identity.source_id,
+                old_path,
+            }));
+    }
+    Ok(moves)
 }
 
 fn persisted_append_proofs(
@@ -778,6 +914,7 @@ fn write_index(
     stage: &ProjectionStage,
     states: &HashMap<String, SourceFileState>,
     state_refreshes: &[SourceFileState],
+    stale_bindings: &[StaleBinding],
     omitted_paths: &BTreeSet<PathBuf>,
     retained_hot_paths: &HashSet<String>,
     cold_ids: &HashSet<String>,
@@ -820,6 +957,17 @@ fn write_index(
     };
     let transaction_result = (|| {
         let mut transaction = writer.begin().map_err(|error| error.to_string())?;
+        // A moved file is reindexed as its existing session: drop the cursor
+        // left at the vanished path so the session keeps one source file. The
+        // session row itself is rebound by the full replace in `apply_staged`.
+        for stale in stale_bindings {
+            if omitted_paths.contains(&stale.new_path) {
+                continue;
+            }
+            transaction
+                .delete_source_file(stale.source_id, &stale.old_path)
+                .map_err(|error| error.to_string())?;
+        }
         for refresh in state_refreshes {
             if omitted_paths.contains(Path::new(&refresh.file_path)) {
                 continue;
