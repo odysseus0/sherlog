@@ -1724,3 +1724,169 @@ fn pagination_fallback_identity_and_repeated_metadata_stay_stable() {
     assert_eq!((retained.removed, retained.retained_cold), (0, 1));
     assert_eq!(projection_view(&db, &stem).1.len(), 2);
 }
+
+fn source_file_paths(db: &Path) -> Vec<String> {
+    let connection = Connection::open(db).unwrap();
+    let mut statement = connection
+        .prepare("SELECT file_path FROM source_files ORDER BY file_path")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn session_file_path(db: &Path) -> Vec<(String, String)> {
+    let connection = Connection::open(db).unwrap();
+    let mut statement = connection
+        .prepare("SELECT file_path, source_root FROM session_rows ORDER BY file_path")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// Codex archives a session by moving its rollout from the dated hot tree to
+/// `archived_sessions/`. Syncing the archive root must rebind the existing
+/// session to the new path, not attach a second source file to it.
+#[test]
+fn archived_move_rebinds_the_session_to_its_new_path() {
+    let temp = tempdir().unwrap();
+    let hot = temp.path().join("sessions");
+    let archived = temp.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let id = "019f9033-a3bd-7b00-9a37-50e2f05e455e";
+    let name = format!("rollout-2026-08-15T00-00-00-{id}.jsonl");
+    let hot_path = hot.join("2026/08/15").join(&name);
+    let archived_path = archived.join(&name);
+    write_session(
+        &hot_path,
+        id,
+        "/work",
+        &[("user_message", "before archive")],
+    );
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, selector(&hot))).unwrap();
+
+    // The session grows after the indexed snapshot, then Codex archives it,
+    // so the stale hot cursor's next_seq no longer matches the session.
+    append_message(&hot_path, "agent_message", "after archive", 2);
+    fs::rename(&hot_path, &archived_path).unwrap();
+
+    let report = run(SyncRequest::new(&db, selector(&archived))).unwrap();
+    assert_eq!(report.errors, 0, "{:?}", report.error_details);
+    let reader = IndexReader::open(&db).unwrap();
+    assert!(reader.check_invariants().unwrap().is_valid());
+    assert_eq!(
+        source_file_paths(&db),
+        vec![archived_path.to_string_lossy().into_owned()]
+    );
+    assert_eq!(
+        session_file_path(&db),
+        vec![(
+            archived_path.to_string_lossy().into_owned(),
+            archived.to_string_lossy().into_owned()
+        )]
+    );
+    let (_, messages) = projection_view(&db, id);
+    assert_eq!(messages.len(), 2);
+
+    // A later hot sync with prune neither resurrects nor drops the session.
+    let mut request = SyncRequest::new(&db, selector(&hot));
+    request.prune = true;
+    request.cold_roots = vec![archived.clone()];
+    let report = run(request).unwrap();
+    assert_eq!(report.errors, 0, "{:?}", report.error_details);
+    assert_eq!(session_file_path(&db).len(), 1);
+    assert_eq!(source_file_paths(&db).len(), 1);
+    assert!(
+        IndexReader::open(&db)
+            .unwrap()
+            .check_invariants()
+            .unwrap()
+            .is_valid()
+    );
+}
+
+/// The same move inside one root without `--prune` must not leave a second
+/// cursor at the vanished path either.
+#[test]
+fn hot_move_without_prune_keeps_one_source_file() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let original = root.join(format!("2026/08/15/rollout-original-{id}.jsonl"));
+    let moved = root.join(format!("2026/08/16/rollout-original-{id}.jsonl"));
+    write_session(&original, id, "/work", &[("user_message", "one")]);
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, selector(&root))).unwrap();
+
+    append_message(&original, "agent_message", "two", 2);
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(&original, &moved).unwrap();
+    let report = run(SyncRequest::new(&db, selector(&root))).unwrap();
+    assert_eq!(report.errors, 0, "{:?}", report.error_details);
+    assert!(
+        IndexReader::open(&db)
+            .unwrap()
+            .check_invariants()
+            .unwrap()
+            .is_valid()
+    );
+    assert_eq!(
+        source_file_paths(&db),
+        vec![moved.to_string_lossy().into_owned()]
+    );
+    assert_eq!(projection_view(&db, id).1.len(), 2);
+}
+
+/// A copy is not a move: while the indexed path still exists, a second file
+/// with the same session identity is refused on its own.
+#[test]
+fn archived_copy_is_a_per_file_duplicate_error() {
+    let temp = tempdir().unwrap();
+    let hot = temp.path().join("sessions");
+    let archived = temp.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let other = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let name = format!("rollout-2026-08-15T00-00-00-{id}.jsonl");
+    let hot_path = hot.join("2026/08/15").join(&name);
+    write_session(&hot_path, id, "/work", &[("user_message", "kept")]);
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, selector(&hot))).unwrap();
+    fs::copy(&hot_path, archived.join(&name)).unwrap();
+    write_session(
+        &archived.join(format!("rollout-2026-08-15T00-00-01-{other}.jsonl")),
+        other,
+        "/work",
+        &[("user_message", "unrelated archived session")],
+    );
+
+    let failure = run(SyncRequest::new(&db, selector(&archived))).unwrap_err();
+    assert_eq!(failure.report.errors, 1);
+    assert!(
+        failure.report.error_details[0]
+            .message
+            .contains("duplicate")
+    );
+    assert_eq!(
+        source_file_paths(&db),
+        vec![hot_path.to_string_lossy().into_owned()]
+    );
+
+    let mut request = SyncRequest::new(&db, selector(&archived));
+    request.best_effort = true;
+    let report = run(request).unwrap();
+    assert_eq!((report.errors, report.added), (1, 1));
+    let reader = IndexReader::open(&db).unwrap();
+    assert!(reader.check_invariants().unwrap().is_valid());
+    assert_eq!(source_file_paths(&db).len(), 2);
+    assert!(
+        source_file_paths(&db).contains(&hot_path.to_string_lossy().into_owned()),
+        "the original binding is kept"
+    );
+}
