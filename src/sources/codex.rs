@@ -440,19 +440,18 @@ fn finish_projection(
     // A paginated continuation shares the base session id with the segment it
     // resumes, but it is a distinct rollout file.  The index stores documents
     // against one file per session, so each segment needs its own identity
-    // instead of overwriting the conversation it continues.
-    let segment_id = if state.paginated_segment {
-        extract_trailing_filename_uuid(&file.file_path)
-            .filter(|segment| *segment != state.session_id)
-            .or_else(|| {
-                file.file_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(str::to_owned)
-            })
-    } else {
-        None
-    };
+    // instead of overwriting the conversation it continues.  The filename's
+    // trailing uuid names the segment whether or not its session_meta carries
+    // `history_base`; older paginated rollouts omit it.
+    let segment_id = extract_trailing_filename_uuid(&file.file_path)
+        .filter(|segment| *segment != state.session_id)
+        .or_else(|| {
+            state
+                .paginated_segment
+                .then(|| file.file_path.file_stem().and_then(|stem| stem.to_str()))
+                .flatten()
+                .map(str::to_owned)
+        });
     if state.session_id.is_empty() && state.next_seq > 0 {
         state.session_id = fallback_session_id(file);
     }
