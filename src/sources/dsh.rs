@@ -117,7 +117,8 @@ pub(crate) fn project(
     let mut model = String::new();
     let mut session_timestamp = String::new();
     let mut title = String::new();
-    let read = read_bounded_zstd_lines(file, read_limit, |record| {
+    // DSH keeps `0` locators; see docs/SOURCE_CONTRACTS.md.
+    let read = read_bounded_zstd_lines(file, read_limit, |record, _, _| {
         if let Some(session) = accepted_session(record) {
             if session_id.is_empty() && !session.session_id.is_empty() {
                 session_id = session.session_id;

@@ -217,7 +217,14 @@ pub(crate) fn scan_zstd_json_records(
     })?;
     // Metadata scans only run over fully captured files, so a final
     // unterminated record (captured between writes) may still be parsed.
-    for_each_zstd_record(decoder, path, "read source metadata", true, callback)
+    let mut callback = callback;
+    for_each_zstd_record(
+        decoder,
+        path,
+        "read source metadata",
+        true,
+        |record, _, _| callback(record),
+    )
 }
 
 /// Shared zstd JSONL decode loop: streams newline-delimited JSON objects,
@@ -225,15 +232,22 @@ pub(crate) fn scan_zstd_json_records(
 /// accept_unterminated_tail is false, a final non-newline-terminated record
 /// is not delivered, keeping projection append-safe. A false return from the
 /// callback stops the scan early.
+///
+/// The callback also receives the record's `[start, end)` byte span in the
+/// decompressed stream (end excludes the line terminator), the same locator
+/// `read_bounded_lines` reports for a plain file. Decoding is streaming: the
+/// decoder keeps zstd's default window limit (frames that demand a larger
+/// window are a hard error) and only the current record is buffered.
 fn for_each_zstd_record(
     reader: impl Read,
     path: &Path,
     operation: &'static str,
     accept_unterminated_tail: bool,
-    mut callback: impl FnMut(&Map<String, Value>) -> bool,
+    mut callback: impl FnMut(&Map<String, Value>, u64, u64) -> bool,
 ) -> Result<(), SourceError> {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
+    let mut offset = 0_u64;
 
     loop {
         buffer.clear();
@@ -256,6 +270,8 @@ fn for_each_zstd_record(
         if bytes_read == 0 {
             break;
         }
+        let line_start = offset;
+        offset = offset.saturating_add(bytes_read as u64);
         let newline_terminated = buffer.last() == Some(&b'\n');
         if !newline_terminated && !accept_unterminated_tail {
             continue;
@@ -272,7 +288,7 @@ fn for_each_zstd_record(
         let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(json) else {
             continue;
         };
-        if !callback(&record) {
+        if !callback(&record, line_start, line_start + content_len as u64) {
             break;
         }
     }
@@ -281,15 +297,17 @@ fn for_each_zstd_record(
 
 /// Full-file projection reader for zstd-compressed JSONL sources.
 ///
-/// DSH does not currently support append deltas, so this helper always reads
-/// the full compressed file and verifies the raw compressed prefix. The
-/// decompressed JSONL line offsets are not linear in the compressed file;
-/// source documents therefore use `0` raw locators and `read-*` continues to
-/// serve text from SQLite.
+/// Compressed sources do not support append deltas, so this helper always
+/// reads the full compressed file (bounded by `requested_limit` compressed
+/// bytes) and proves the raw compressed prefix. The callback receives each
+/// record's span in the decompressed stream; those offsets are not positions
+/// in the compressed file, so an adapter decides whether they are meaningful
+/// locators (Codex: yes, the stream is the plain rollout byte for byte; DSH:
+/// no, it stores `0`). `read-*` always serves text from SQLite.
 pub(crate) fn read_bounded_zstd_lines(
     file: &SourceFile,
     requested_limit: u64,
-    mut callback: impl FnMut(&Map<String, Value>) -> Result<(), FullProjectionReason>,
+    mut callback: impl FnMut(&Map<String, Value>, u64, u64) -> Result<(), FullProjectionReason>,
 ) -> Result<BoundedRead, SourceError> {
     let handle = File::open(&file.file_path).map_err(|source| SourceError::Io {
         operation: "open source file",
@@ -336,9 +354,9 @@ pub(crate) fn read_bounded_zstd_lines(
         &file.file_path,
         "read source file",
         false,
-        |record| {
+        |record, raw_start, raw_end| {
             if callback_failure.is_none() {
-                if let Err(reason) = callback(record) {
+                if let Err(reason) = callback(record, raw_start, raw_end) {
                     callback_failure = Some(reason);
                 }
             }
