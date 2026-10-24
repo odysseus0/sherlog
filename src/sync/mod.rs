@@ -827,6 +827,12 @@ fn resolve_session_moves(
             continue;
         }
         let current = path.to_string_lossy();
+        // The scan never selects both storage forms of one Codex rollout, so a
+        // binding at the staged file's twin is superseded even while the twin
+        // still exists (mid-compression or mid-resume).
+        let twin = SourceCatalog
+            .superseded_path(identity.source_id, path)
+            .map(|twin| twin.to_string_lossy().into_owned());
         let mut live = Vec::new();
         let mut gone = Vec::new();
         for other in reader
@@ -834,6 +840,10 @@ fn resolve_session_moves(
             .map_err(|error| error.to_string())?
         {
             if other == current {
+                continue;
+            }
+            if twin.as_deref() == Some(other.as_str()) {
+                gone.push(other);
                 continue;
             }
             // Only a proven absence counts as a move; an unreadable path
@@ -1096,6 +1106,13 @@ fn apply_staged(
 ) -> Result<(), String> {
     let path = record.file.file_path.to_string_lossy().into_owned();
     let prior = states.get(&path);
+    // The same session moving to its other storage form (Codex compressing an
+    // idle rollout, or decompressing it on resume) is an update of the stored
+    // session, not a new one.
+    let moved_from = SourceCatalog
+        .superseded_path(record.file.source_id, &record.file.file_path)
+        .and_then(|twin| states.get(twin.to_string_lossy().as_ref()))
+        .and_then(|state| state.session.as_ref());
     match record.outcome {
         ProjectionOutcome::Projected(projected) => {
             let identity = projection_identity(&projected)?;
@@ -1126,7 +1143,9 @@ fn apply_staged(
                     transaction
                         .replace_session(&session, &messages)
                         .map_err(|error| error.to_string())?;
-                    if prior.and_then(|state| state.session.as_ref()).is_some() {
+                    if prior.and_then(|state| state.session.as_ref()).is_some()
+                        || moved_from == Some(&identity)
+                    {
                         applied.updated = applied.updated.saturating_add(1);
                     } else {
                         applied.added = applied.added.saturating_add(1);

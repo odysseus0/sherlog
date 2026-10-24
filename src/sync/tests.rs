@@ -1993,3 +1993,315 @@ fn claude_code_moved_transcript_rebinds_the_session() {
         )]
     );
 }
+
+/// One Codex rollout's storage on disk: the plain file and/or its compressed
+/// twin, each holding the first `n` messages of the same session.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RolloutForms {
+    plain: Option<usize>,
+    compressed: Option<usize>,
+}
+
+const ROLLOUT_MESSAGES: [(&str, &str); 2] = [
+    ("user_message", "storage move question"),
+    ("agent_message", "storage move answer"),
+];
+
+fn rollout_bytes(id: &str, messages: usize) -> Vec<u8> {
+    let scratch = tempdir().unwrap();
+    let path = scratch.path().join("rollout.jsonl");
+    write_session(&path, id, "/work", &ROLLOUT_MESSAGES[..messages]);
+    fs::read(path).unwrap()
+}
+
+/// Codex's own encoding: one zstd stream of the plain bytes, published by
+/// rename so a compressed file is never observed half written.
+fn write_compressed_rollout(path: &Path, plain: &[u8]) {
+    let staging = path.with_extension("zst.compress.tmp");
+    fs::write(&staging, zstd::stream::encode_all(plain, 3).unwrap()).unwrap();
+    fs::rename(&staging, path).unwrap();
+}
+
+fn apply_rollout_forms(plain_path: &Path, id: &str, forms: RolloutForms) {
+    fs::create_dir_all(plain_path.parent().unwrap()).unwrap();
+    let compressed_path = PathBuf::from(format!("{}.zst", plain_path.to_string_lossy()));
+    match forms.plain {
+        Some(messages) => {
+            let wanted = rollout_bytes(id, messages);
+            match fs::read(plain_path) {
+                Ok(current) if current == wanted => {}
+                // Codex appends to a live rollout in place.
+                Ok(current) if wanted.starts_with(&current) => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(plain_path)
+                        .unwrap()
+                        .write_all(&wanted[current.len()..])
+                        .unwrap();
+                }
+                _ => {
+                    let staging = plain_path.with_extension("materialize.tmp");
+                    fs::write(&staging, wanted).unwrap();
+                    fs::rename(&staging, plain_path).unwrap();
+                }
+            }
+        }
+        None => {
+            let _ = fs::remove_file(plain_path);
+        }
+    }
+    match forms.compressed {
+        Some(messages) => {
+            let wanted = rollout_bytes(id, messages);
+            let current = fs::read(&compressed_path)
+                .ok()
+                .and_then(|bytes| zstd::stream::decode_all(&bytes[..]).ok());
+            if current.as_deref() != Some(&wanted[..]) {
+                write_compressed_rollout(&compressed_path, &wanted);
+            }
+        }
+        None => {
+            let _ = fs::remove_file(&compressed_path);
+        }
+    }
+}
+
+/// Everything sync persists for a selector except row ids, write times and
+/// file mtimes: session rows, every document with its raw locator, and every
+/// source cursor with its digests and linked session.
+fn persisted_projection(db: &Path) -> Vec<String> {
+    let connection = Connection::open(db).unwrap();
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT 'session', native_session_id, file_path, source_root, title, summary_text, \
+         cwd, model, started_at, ended_at, path_date, message_count, document_count, \
+         raw_file_size FROM session_rows ORDER BY native_session_id",
+        "SELECT 'document', s.native_session_id, d.kind, d.seq, d.role, d.timestamp, \
+         d.body_text, d.title_text, d.summary_text, d.raw_start, d.raw_end \
+         FROM documents d JOIN session_rows s ON s.id=d.session_id \
+         ORDER BY s.native_session_id, d.kind, d.seq",
+        "SELECT 'source_file', sf.file_path, sf.size, sf.indexed_bytes, sf.next_seq, \
+         sf.head_digest, sf.boundary_digest, sf.cwd, sf.path_date, sf.extra_fingerprint, \
+         s.native_session_id FROM source_files sf LEFT JOIN session_rows s \
+         ON s.id=sf.session_id ORDER BY sf.file_path",
+    ] {
+        let mut statement = connection.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let mut query = statement.query([]).unwrap();
+        while let Some(row) = query.next().unwrap() {
+            let fields = (0..columns)
+                .map(|index| format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap()))
+                .collect::<Vec<_>>();
+            rows.push(fields.join("|"));
+        }
+    }
+    rows
+}
+
+/// Bounded exhaustive check of the `incremental == full replay` invariant over
+/// Codex storage moves. A rollout's on-disk state is its plain file and/or its
+/// compressed twin, each with one or two messages, or nothing at all. Every
+/// two-step sequence of those states, and every three-step sequence of the
+/// states Codex itself produces (live plain file, appended plain file,
+/// compressed file, both during compression or resume), is synced step by
+/// step into one index. After every step the index must equal a fresh full
+/// sync of the same files, keep its invariants, and hold at most one session
+/// read from at most one file.
+#[test]
+fn codex_storage_moves_match_full_replay_for_every_bounded_sequence() {
+    let forms = [None, Some(1), Some(2)];
+    let every = forms
+        .iter()
+        .flat_map(|plain| {
+            forms.iter().map(|compressed| RolloutForms {
+                plain: *plain,
+                compressed: *compressed,
+            })
+        })
+        .collect::<Vec<_>>();
+    let present = every
+        .iter()
+        .copied()
+        .filter(|state| state.plain.is_some() || state.compressed.is_some())
+        .collect::<Vec<_>>();
+    let codex_written = [
+        RolloutForms {
+            plain: Some(1),
+            compressed: None,
+        },
+        RolloutForms {
+            plain: Some(2),
+            compressed: None,
+        },
+        RolloutForms {
+            plain: None,
+            compressed: Some(2),
+        },
+        RolloutForms {
+            plain: Some(2),
+            compressed: Some(2),
+        },
+    ];
+    let temp = tempdir().unwrap();
+    let mut full_replay = HashMap::new();
+    let mut checked = 0;
+    // Without prune a vanished rollout keeps its projection by design, so only
+    // prune runs may visit the empty state.
+    for (prune, states, length) in [
+        (false, &present[..], 2),
+        (true, &every[..], 2),
+        (false, &codex_written[..], 3),
+        (true, &codex_written[..], 3),
+    ] {
+        for sequence in state_sequences(states, length) {
+            check_storage_sequence(temp.path(), prune, &sequence, &mut full_replay);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 8 * 8 + 9 * 9 + 2 * 4 * 4 * 4);
+}
+
+fn state_sequences(states: &[RolloutForms], length: usize) -> Vec<Vec<RolloutForms>> {
+    (0..length).fold(vec![Vec::new()], |prefixes, _| {
+        prefixes
+            .iter()
+            .flat_map(|prefix| {
+                states.iter().map(move |state| {
+                    let mut next = prefix.clone();
+                    next.push(*state);
+                    next
+                })
+            })
+            .collect()
+    })
+}
+
+fn check_storage_sequence(
+    workspace: &Path,
+    prune: bool,
+    sequence: &[RolloutForms],
+    full_replay: &mut HashMap<RolloutForms, Vec<String>>,
+) {
+    let id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let root = workspace.join("sessions");
+    let plain_path = root.join(format!("2026/08/15/rollout-2026-08-15T00-00-00-{id}.jsonl"));
+    let _ = fs::remove_dir_all(&root);
+    let db = workspace.join("incremental.sqlite");
+    let _ = fs::remove_file(&db);
+    for (step, state) in sequence.iter().enumerate() {
+        apply_rollout_forms(&plain_path, id, *state);
+        let mut request = SyncRequest::new(&db, selector(&root));
+        request.prune = prune;
+        run(request)
+            .unwrap_or_else(|failure| panic!("prune={prune} {sequence:?} step {step}: {failure}"));
+        let expected = full_replay.entry(*state).or_insert_with(|| {
+            let fresh = workspace.join("full.sqlite");
+            let _ = fs::remove_file(&fresh);
+            run(SyncRequest::new(&fresh, selector(&root))).unwrap();
+            let projection = persisted_projection(&fresh);
+            let count = |kind: &str| {
+                projection
+                    .iter()
+                    .filter(|row| row.starts_with(&format!("Text(\"{kind}\")")))
+                    .count()
+            };
+            let present = usize::from(state.plain.is_some() || state.compressed.is_some());
+            assert_eq!((count("session"), count("source_file")), (present, present));
+            projection
+        });
+        let reader = IndexReader::open(&db).unwrap();
+        assert!(reader.check_invariants().unwrap().is_valid());
+        assert_eq!(
+            &persisted_projection(&db),
+            expected,
+            "prune={prune} {sequence:?} step {step}"
+        );
+    }
+}
+
+#[test]
+fn archiving_into_a_compressed_rollout_moves_the_session_instead_of_duplicating_it() {
+    let temp = tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let archived = temp.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let moved = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let only_compressed = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    let name = format!("rollout-2026-08-15T00-00-00-{moved}.jsonl");
+    let hot = sessions.join("2026/08/15").join(&name);
+    write_session(&hot, moved, "/work", &ROLLOUT_MESSAGES);
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, selector(&sessions))).unwrap();
+    let before = projection_view(&db, moved);
+
+    // Codex archives the rollout into the flat archive root and later
+    // compresses it there; a second session is only ever seen compressed.
+    write_compressed_rollout(
+        &archived.join(format!("{name}.zst")),
+        &fs::read(&hot).unwrap(),
+    );
+    fs::remove_file(&hot).unwrap();
+    write_compressed_rollout(
+        &archived.join(format!(
+            "rollout-2026-08-16T00-00-00-{only_compressed}.jsonl.zst"
+        )),
+        &rollout_bytes(only_compressed, 1),
+    );
+    // A compression temp file and an unrelated `.zst` are never decoded.
+    fs::write(
+        archived.join("rollout-x.jsonl.zst.compress.1.tmp"),
+        b"partial",
+    )
+    .unwrap();
+    fs::write(archived.join("notes.zst"), b"not a rollout").unwrap();
+
+    let report = run(SyncRequest::new(&db, selector(&archived))).unwrap();
+    assert_eq!((report.scanned, report.added, report.updated), (2, 2, 0));
+    let after = projection_view(&db, moved);
+    assert_eq!(after.1, before.1);
+    assert_eq!(after.0.id, before.0.id);
+    assert_eq!(
+        after.0.file_path,
+        archived.join(format!("{name}.zst")).to_string_lossy()
+    );
+    assert_eq!(projection_view(&db, only_compressed).1.len(), 1);
+
+    // Pruning the hot root drops only its stale cursor, never the session.
+    let mut request = SyncRequest::new(&db, selector(&sessions));
+    request.prune = true;
+    assert_eq!(run(request).unwrap().removed, 0);
+    let reader = IndexReader::open(&db).unwrap();
+    assert!(reader.check_invariants().unwrap().is_valid());
+    assert_eq!(reader.stats(SourceId::Codex).unwrap().session_count, 2);
+    assert_eq!(projection_view(&db, moved).1, before.1);
+    let cursors = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM source_files", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(cursors, 2);
+
+    // A compressed rollout is immutable; a no-op sync re-reads nothing.
+    let noop = run(SyncRequest::new(&db, selector(&archived))).unwrap();
+    assert_eq!((noop.added, noop.updated, noop.skipped), (0, 0, 2));
+}
+
+#[test]
+fn compressing_an_indexed_rollout_in_place_counts_as_an_update() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    let id = "abababab-abab-4bab-8bab-abababababab";
+    let plain = root.join(format!("2026/08/15/rollout-2026-08-15T00-00-00-{id}.jsonl"));
+    write_session(&plain, id, "/work", &ROLLOUT_MESSAGES);
+    let db = temp.path().join("index.sqlite");
+    run(SyncRequest::new(&db, selector(&root))).unwrap();
+    write_compressed_rollout(
+        &PathBuf::from(format!("{}.zst", plain.to_string_lossy())),
+        &fs::read(&plain).unwrap(),
+    );
+    fs::remove_file(&plain).unwrap();
+    let report = run(SyncRequest::new(&db, selector(&root))).unwrap();
+    assert_eq!((report.added, report.updated), (0, 1));
+    assert!(report.coverage.written);
+}

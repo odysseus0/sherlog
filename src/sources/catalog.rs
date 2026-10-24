@@ -226,9 +226,9 @@ impl SourceCatalog {
     /// stored cursor or projection under that path is stale once `file` is
     /// projected. Only Codex has one (`x.jsonl` <-> `x.jsonl.zst`); the scan
     /// never selects both, so the twin is never itself a current source file.
-    pub fn superseded_path(&self, file: &SourceFile) -> Option<PathBuf> {
-        match file.source_id {
-            SourceId::Codex => codex::rollout_twin(&file.file_path),
+    pub fn superseded_path(&self, source_id: SourceId, path: &Path) -> Option<PathBuf> {
+        match source_id {
+            SourceId::Codex => codex::rollout_twin(path),
             SourceId::ClaudeCode | SourceId::Pi | SourceId::Dsh => None,
         }
     }
