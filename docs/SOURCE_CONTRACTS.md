@@ -78,7 +78,18 @@ A normal rollout uses its session UUID. A `history_base` continuation keeps the 
 
 `ACCEPTED_PREFIX` is the single Codex interpretation marker. It versions both accepted-record fingerprints and serialized reducers. A changed marker invalidates inventory caches and makes all older reducers request full replay, including nonempty EOF cursors. Unchanged current files remain no-ops. A valid empty cursor may append its first message and create a session at seq zero without replaying an already understood prefix.
 
-Codex is the only adapter currently implementing true append delta. File identity change, invalid/old reducer, cursor mismatch, prefix rewrite or base-session identity change requires full replay. Tests compare incremental and fresh projections after each record in a mixed-format trace, across pagination append, and during interpretation upgrades. The broader property/state-machine matrix remains future work.
+### Storage forms
+
+A Codex rollout is either plain `rollout-*.jsonl` or, after Codex compresses an idle rollout, `rollout-*.jsonl.zst`: one zstd stream of the exact plain bytes, published under its final name only when complete (Codex writes a temporary file and renames it), after which Codex removes the plain file. Resuming the thread decompresses it back to plain JSONL first. Both forms are accepted under any synced root, including `~/.codex/archived_sessions`; registered cold roots stay presence-only (see `docs/COLD_RETENTION.md`).
+
+- Only the exact `.jsonl.zst` suffix is decoded. Other `.zst` names, and Codex's in-flight `*.compress.*.tmp` files, are not source files.
+- While both forms of one rollout exist (mid-compression or mid-resume), the scan reads the plain file and ignores the compressed twin, as Codex does. One rollout is therefore one source file, independent of traversal order.
+- Decoding streams through the shared bounded zstd reader: content projection reads no compressed bytes beyond the captured limit, the decoder keeps zstd's default window limit (a frame that demands more is a hard per-file error), and only the current record is buffered. Decompressed records go through the same allowlist as plain records; inventory fingerprints cover accepted records only, so both forms of one rollout have the same accepted metadata.
+- Document locators of a compressed rollout are offsets in its decompressed stream, which is the plain rollout byte for byte. Both forms of one rollout project identical sessions and documents; only `filePath` differs.
+- A compressed rollout is immutable, so it never appends: an offered checkpoint returns `DeltaUnsupported` and the file is replayed in full. The checkpoint and read proof cover the compressed bytes. A torn final frame projects the decodable complete-record prefix; any other decode failure is a hard per-file error.
+- A rollout moving between forms is a session move: the session keeps its row and identity, its stored path moves to the projected file, and the cursor bound at the twin path is dropped in the same transaction. The twin counts as superseded even while it still exists, because the scan never selects both forms; any other still-existing path bound to the same session makes the staged file a refused duplicate, as for any move.
+
+Codex is the only adapter currently implementing true append delta. File identity change, invalid/old reducer, cursor mismatch, prefix rewrite or base-session identity change requires full replay. Tests compare incremental and fresh projections after each record in a mixed-format trace, across pagination append, during interpretation upgrades, and over a bounded exhaustive set of plain/compressed storage-move sequences (with and without prune). The broader property/state-machine matrix remains future work.
 
 ## Claude Code adapter (experimental)
 
@@ -156,7 +167,7 @@ Rejected:
 - incomplete session/message records;
 - malformed/non-object lines.
 
-DSH currently requests full replay when an existing checkpoint is offered (`DeltaUnsupported`). Raw byte locators are `0` because decompressed JSONL offsets are not linear in the compressed file; `read-*` serves text from SQLite.
+DSH currently requests full replay when an existing checkpoint is offered (`DeltaUnsupported`). Raw byte locators are `0` because decompressed JSONL offsets are not positions in the compressed file; `read-*` serves text from SQLite. (Codex compressed rollouts keep decompressed offsets instead, because those equal the plain rollout's offsets; see Codex storage forms.)
 
 A torn final zstd frame (interrupted or in-flight write; DSH repairs torn tails itself) ends the decodable record stream without failing the file: the complete prefix is projected, and the next sync replays in full once the file is repaired. Any other decode failure (corrupt header, corrupt block, bad frame parameter) remains a hard per-file error.
 
